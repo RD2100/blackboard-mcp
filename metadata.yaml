@@ -1,0 +1,18 @@
+---
+name: blackboard-mcp
+description: Cross-session coordination server for Claude Code — file locks, build locks, knowledge sharing, and a real-time dashboard
+tags:
+  - claude-code
+  - mcp
+  - model-context-protocol
+  - multi-agent
+  - coordination
+  - session-management
+  - file-lock
+  - knowledge-sharing
+  - dashboard
+version: 4.0.0
+author: RD
+license: MIT
+repository: https://github.com/RD2100/blackboard-mcp
+---

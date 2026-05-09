@@ -1,0 +1,35 @@
+{
+  "name": "blackboard-mcp",
+  "version": "4.0.0",
+  "description": "Cross-session coordination server for Claude Code — file locks, build locks, knowledge sharing, and a real-time dashboard",
+  "main": "server.py",
+  "scripts": {
+    "dashboard": "python scripts/bb-monitor-gui.py"
+  },
+  "keywords": [
+    "claude-code",
+    "mcp",
+    "model-context-protocol",
+    "multi-agent",
+    "coordination",
+    "session-management",
+    "file-lock",
+    "knowledge-sharing",
+    "dashboard"
+  ],
+  "author": "RD",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/RD2100/blackboard-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/RD2100/blackboard-mcp/issues"
+  },
+  "engines": {
+    "python": ">=3.10"
+  },
+  "dependencies": {
+    "mcp": ">=1.0.0"
+  }
+}
