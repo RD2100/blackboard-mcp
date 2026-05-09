@@ -1,0 +1,7 @@
+# Runtime data — do not commit
+state.json
+state.json.bak
+events.log
+__pycache__/
+*.pyc
+.DS_Store
