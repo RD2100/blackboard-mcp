@@ -2,6 +2,10 @@
 state.json
 state.json.bak
 events.log
+*.tmp
 __pycache__/
 *.pyc
+*.pyo
 .DS_Store
+.env
+.env.*

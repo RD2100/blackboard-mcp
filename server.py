@@ -45,10 +45,10 @@ _state_mtime = 0  # 磁盘state.json最后修改时间，用于检测hook写入
 
 
 def _discover_state_file():
-    """发现state.json路径: 项目级 > 全局"""
+    """Discover state.json path: project-level > global"""
     for env_var in ["CLAUDE_PROJECT_DIR", "PWD"]:
         d = os.environ.get(env_var, "")
-        if d:
+        if d and ".." not in d:  # prevent directory traversal
             p = os.path.join(d, ".claude", "blackboard", "state.json")
             if os.path.isfile(p):
                 return os.path.dirname(p), p
