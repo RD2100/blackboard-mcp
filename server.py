@@ -249,6 +249,17 @@ def _auto_cleanup(caller_sid=None):
             if owner == sid:
                 del _state["build_locks"][proj]
 
+    # Release expired build locks (>10min held, regardless of session status)
+    for proj in list(_state.get("build_locks", {})):
+        lock = _state["build_locks"][proj]
+        if isinstance(lock, dict) and lock.get("acquired_at"):
+            try:
+                at = datetime.fromisoformat(lock["acquired_at"].replace("Z", "+00:00"))
+                if (now - at).total_seconds() > 600:
+                    del _state["build_locks"][proj]
+            except (ValueError, KeyError):
+                del _state["build_locks"][proj]
+
     # 刷新调用者心跳
     if caller_sid and caller_sid in _state.get("sessions", {}):
         _state["sessions"][caller_sid]["heartbeat"] = _now()
