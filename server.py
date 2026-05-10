@@ -29,7 +29,9 @@ mcp = FastMCP("blackboard")
 
 # ─── 配置 ───
 
-STALE_TIMEOUT_MINUTES = 30  # 30min无心跳才标记stale（给MCP重启恢复窗口）
+STALE_SOFT_MINUTES = 30  # 30min无心跳标记stale（soft级别，可恢复）
+STALE_HARD_MINUTES = 35  # stale超过5min才标记ended（hard级别，不可恢复）
+ENDED_PURGE_HOURS = 24   # ended session超过24h从state.json删除
 KNOWLEDGE_HALF_LIFE_DAYS = 30
 KNOWLEDGE_ARCHIVE_DAYS = 60
 SOLIDIFY_THRESHOLD = 0.8
@@ -78,6 +80,13 @@ def _is_uuid(s):
         return True
     except (ValueError, AttributeError):
         return False
+
+
+def _require_uuid(session_id: str) -> str:
+    """校验session_id必须是UUID格式，否则返回错误信息。所有bb_*工具调用前必须先调用此函数。"""
+    if not session_id or not _is_uuid(session_id):
+        return f"ERROR: session_id必须是UUID格式，收到'{session_id}'。请使用SessionStart hook注入的session_id。"
+    return ""
 
 
 def _empty_state():
@@ -340,49 +349,51 @@ def _decay_loop():
 # ─── MCP工具 ───
 
 @mcp.tool()
-def bb_register(name: str, task: str = "", session_id: str = "") -> str:
+def bb_register(session_id: str, name: str = "", task: str = "") -> str:
     """注册或更新session信息。新session启动时调用。
-    session_id: 由SessionStart hook注入的UUID，用于查找已有session。必须使用hook注入的值，不要用自定义名字。
+    session_id: 必填。由SessionStart hook注入的UUID，用于查找已有session。必须使用hook注入的值，不要用自定义名字。
     name: 显示名称（可选，用于覆盖UUID显示）。
     task: 当前任务描述，必须写清楚你在做什么。"""
+    # session_id必须是UUID格式
+    if not _is_uuid(session_id):
+        return f"ERROR: session_id必须是UUID格式，收到'{session_id}'。请使用SessionStart hook注入的session_id。"
     with _lock:
-        _auto_cleanup(session_id or name)
+        _auto_cleanup(session_id)
         _state.setdefault("sessions", {})
         ts = _now()
 
-        # 以session_id为主键查找已有session
-        sid = session_id or name
-        if sid in _state["sessions"]:
+        if session_id in _state["sessions"]:
             # 更新已有session（hook已注册，Claude补充task/name）
-            existing = _state["sessions"][sid]
+            existing = _state["sessions"][session_id]
             existing["heartbeat"] = ts
             existing["status"] = "active"
             if task:
                 existing["task"] = task
-            if name and name != sid:
+            if name:
                 existing["display_name"] = name
             _save_state()
             _rotate_events()
-            _append_event(f"{ts} | {sid} | REGISTERED | task={task}")
-            return f"Updated: {sid} (task={existing.get('task','')})"
+            _append_event(f"{ts} | {session_id} | REGISTERED | name={name} task={task}")
+            display = existing.get("display_name", session_id[:8])
+            return f"Updated: {display} (task={existing.get('task','')})"
 
-        # 新session（name作为主键，兼容无session_id的情况）
-        if name in _state["sessions"]:
-            _state["sessions"][name].update({"name": name, "task": task, "heartbeat": ts, "status": "active"})
-        else:
-            _state["sessions"][name] = {
-                "name": name, "started_at": ts, "heartbeat": ts,
-                "status": "active", "task": task, "claimed_files": [],
-            }
+        # 新session（session_id作为主键）
+        _state["sessions"][session_id] = {
+            "name": name or session_id, "display_name": name or "",
+            "started_at": ts, "heartbeat": ts,
+            "status": "active", "task": task, "claimed_files": [],
+        }
         _save_state()
         _rotate_events()
-    _append_event(f"{ts} | {name} | REGISTERED | task={task}")
-    return f"Registered: {name}"
+    _append_event(f"{ts} | {session_id} | REGISTERED | name={name} task={task}")
+    return f"Registered: {name or session_id[:8]} (sid={session_id})"
 
 
 @mcp.tool()
 def bb_deregister(session_id: str) -> str:
     """注销session，释放所有文件占用和编译锁。"""
+    err = _require_uuid(session_id)
+    if err: return err
     released = []
     with _lock:
         _auto_cleanup(session_id)
@@ -405,6 +416,8 @@ def bb_deregister(session_id: str) -> str:
 @mcp.tool()
 def bb_heartbeat(session_id: str) -> str:
     """刷新session心跳。15分钟无心跳标记stale。"""
+    err = _require_uuid(session_id)
+    if err: return err
     with _lock:
         _auto_cleanup(session_id)
         if session_id in _state.get("sessions", {}):
@@ -418,6 +431,8 @@ def bb_heartbeat(session_id: str) -> str:
 @mcp.tool()
 def bb_claim_file(session_id: str, file_path: str) -> str:
     """声明文件占用。冲突返回CONFLICT，已占用返回OWN，成功返回CLAIMED。"""
+    err = _require_uuid(session_id)
+    if err: return err
     file_path = file_path.lstrip("./")
     with _lock:
         _auto_cleanup(session_id)
@@ -441,6 +456,8 @@ def bb_claim_file(session_id: str, file_path: str) -> str:
 @mcp.tool()
 def bb_release_file(session_id: str, file_path: str) -> str:
     """释放文件占用。"""
+    err = _require_uuid(session_id)
+    if err: return err
     file_path = file_path.lstrip("./")
     with _lock:
         _auto_cleanup(session_id)
@@ -480,6 +497,8 @@ def bb_check_conflicts(file_paths: str = "") -> str:
 @mcp.tool()
 def bb_acquire_build_lock(session_id: str, project_dir: str = "") -> str:
     """获取编译锁。同一项目只允许1个session编译。返回ACQUIRED或CONFLICT。"""
+    err = _require_uuid(session_id)
+    if err: return err
     with _lock:
         _auto_cleanup(session_id)
         locks = _state.setdefault("build_locks", {})
@@ -512,6 +531,8 @@ def bb_acquire_build_lock(session_id: str, project_dir: str = "") -> str:
 @mcp.tool()
 def bb_release_build_lock(session_id: str, project_dir: str = "") -> str:
     """释放编译锁。编译完成后必须调用。"""
+    err = _require_uuid(session_id)
+    if err: return err
     with _lock:
         _auto_cleanup(session_id)
         locks = _state.get("build_locks", {})
@@ -600,6 +621,8 @@ def bb_status() -> str:
 @mcp.tool()
 def bb_event(session_id: str, event_type: str, details: str = "") -> str:
     """记录事件。类型: SESSION_STARTED/ENDED, DISCOVERY, WARNING, ERROR, MILESTONE, DECISION, BLOCKED, UNBLOCKED, CUSTOM。"""
+    err = _require_uuid(session_id)
+    if err: return err
     with _lock:
         _auto_cleanup(session_id)
         if session_id in _state.get("sessions", {}):
@@ -613,6 +636,8 @@ def bb_event(session_id: str, event_type: str, details: str = "") -> str:
 @mcp.tool()
 def bb_session_files(session_id: str) -> str:
     """列出session占用的所有文件。"""
+    err = _require_uuid(session_id)
+    if err: return err
     with _lock:
         _auto_cleanup(session_id)
         session = _state.get("sessions", {}).get(session_id)
@@ -629,6 +654,8 @@ def bb_session_files(session_id: str) -> str:
 @mcp.tool()
 def bb_share_knowledge(session_id: str, fingerprint: str, category: str, text: str) -> str:
     """共享知识。fingerprint用于去重。category: bug_fix/architecture/performance/api/config/pattern/other"""
+    err = _require_uuid(session_id)
+    if err: return err
     ts = _now()
     with _lock:
         _auto_cleanup(session_id)
@@ -683,6 +710,8 @@ def bb_search_knowledge(query: str, category: str = "") -> str:
 @mcp.tool()
 def bb_validate_knowledge(session_id: str, fingerprint: str, verdict: str, note: str = "") -> str:
     """验证知识。verdict: confirmed(+0.2)/refuted(-0.5)/observed(+0.1)"""
+    err = _require_uuid(session_id)
+    if err: return err
     ts = _now()
     with _lock:
         _auto_cleanup(session_id)
@@ -761,6 +790,8 @@ def bb_get_recent_knowledge(hours: int = 48) -> str:
 @mcp.tool()
 def bb_share_decision(session_id: str, decision: str, rationale: str = "") -> str:
     """记录架构/设计决策。永久保留。"""
+    err = _require_uuid(session_id)
+    if err: return err
     ts = _now()
     with _lock:
         _auto_cleanup(session_id)
@@ -777,6 +808,8 @@ def bb_share_decision(session_id: str, decision: str, rationale: str = "") -> st
 @mcp.tool()
 def bb_report_bug_pattern(session_id: str, pattern: str, root_cause: str, fix: str) -> str:
     """报告Bug模式/踩坑经验。永久保留。"""
+    err = _require_uuid(session_id)
+    if err: return err
     ts = _now()
     with _lock:
         _auto_cleanup(session_id)

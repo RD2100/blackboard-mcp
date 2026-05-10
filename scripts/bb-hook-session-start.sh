@@ -121,25 +121,42 @@ try:
             state = {"version":4,"sessions":{},"file_registry":{},"build_locks":{},"knowledge":{},"decisions":[],"bug_patterns":[]}
 
     now = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    cutoff = timedelta(minutes=15)
+    soft_cutoff = timedelta(minutes=30)  # 30min无心跳→stale
+    hard_cutoff = timedelta(minutes=35)  # stale超过5min→ended
 
     state.setdefault("sessions", {})
     state.setdefault("file_registry", {})
     state.setdefault("build_locks", {})
 
-    # Cleanup stale sessions (>15min no heartbeat)
+    # 两级stale清理：soft(可恢复) → hard(ended+释放资源)
     for sid in list(state["sessions"]):
         s = state["sessions"][sid]
-        if s.get("status") != "active":
+        if s.get("status") not in ("active", "stale"):
             continue
         try:
             hb = datetime.fromisoformat(s["heartbeat"].replace("Z", "+00:00"))
-            if now - hb > cutoff:
-                for fp in s.get("claimed_files", []):
+            if s.get("status") == "stale" and (now - hb) > hard_cutoff:
+                # Hard: stale超时 → ended，释放资源
+                for fp in list(s.get("claimed_files", [])):
                     state["file_registry"].pop(fp, None)
-                del state["sessions"][sid]
+                s["claimed_files"] = []
+                s["status"] = "ended"
+            elif (now - hb) > soft_cutoff:
+                # Soft: 30min无心跳 → stale
+                s["status"] = "stale"
         except (ValueError, KeyError):
-            del state["sessions"][sid]
+            pass
+
+    # Orphan资源清理：owner不存在或非active → 释放
+    active_sids = {sid for sid, s in state["sessions"].items() if s.get("status") == "active"}
+    for fp in list(state.get("file_registry", {})):
+        if state["file_registry"][fp] not in active_sids:
+            del state["file_registry"][fp]
+    for proj in list(state.get("build_locks", {})):
+        lock = state["build_locks"][proj]
+        owner = lock if isinstance(lock, str) else lock.get("session_id", "")
+        if owner not in active_sids:
+            del state["build_locks"][proj]
 
     # Cleanup expired build locks (>10min held)
     for proj in list(state.get("build_locks", {})):
