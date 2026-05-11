@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
-"""Blackboard MCP Server v4 — 少即是多
+"""Blackboard MCP Server v4 — 双层架构
 
-精简原则:
-  - MCP是唯一的真相来源，无shell脚本直接写state.json
-  - 每次工具调用自动清理stale session（>15min无心跳）
-  - 每次工具调用自动刷新调用者心跳
-  - 原子写入 + .bak备份 + events.log回放恢复
+双层state.json:
+  - 全局(~/.claude/blackboard/state.json): sessions + knowledge + decisions + bug_patterns
+  - 项目级(项目/.claude/blackboard/state.json): file_registry + build_locks
 
-三层知识模型:
-  - 临时知识(knowledge): 有可信度+衰减，30天降权/60天归档
-  - 决策记录(decisions): 永久保留
-  - Bug模式(bug_patterns): 永久保留
+所有项目共享同一个全局注册中心，文件冲突和编译锁按项目隔离。
+
+生命周期:
+  active → (30min无心跳) → stale → (5min恢复窗口) → ended → (24h) → 删除
+  stale session心跳恢复时自动回到active
 """
 
 import json
 import os
 import shutil
-import sys
 import tempfile
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
@@ -29,51 +26,55 @@ mcp = FastMCP("blackboard")
 
 # ─── 配置 ───
 
-STALE_SOFT_MINUTES = 30  # 30min无心跳标记stale（soft级别，可恢复）
-STALE_HARD_MINUTES = 35  # stale超过5min才标记ended（hard级别，不可恢复）
-ENDED_PURGE_HOURS = 24   # ended session超过24h从state.json删除
+STALE_SOFT_MINUTES = 30
+STALE_HARD_MINUTES = 35
+ENDED_PURGE_HOURS = 24
+BUILD_LOCK_TIMEOUT_SECONDS = 600
 KNOWLEDGE_HALF_LIFE_DAYS = 30
 KNOWLEDGE_ARCHIVE_DAYS = 60
 SOLIDIFY_THRESHOLD = 0.8
-DECAY_INTERVAL = 3600  # 每小时检查衰减
+DECAY_INTERVAL = 3600
 
 # ─── 状态管理 ───
 
 _lock = threading.Lock()
-_state = {}
-_state_file = None
+_state = {}       # 全局: sessions + knowledge + decisions + bug_patterns
+_proj_state = {}  # 项目级: file_registry + build_locks
+_global_file = None
+_proj_file = None
 _events_file = None
-_state_mtime = 0  # 磁盘state.json最后修改时间，用于检测hook写入
+_global_mtime = 0
+_proj_mtime = 0
+
+GLOBAL_BB_DIR = os.path.join(os.path.expanduser("~"), ".claude", "blackboard")
 
 
-def _discover_state_file():
-    """Discover state.json path: project-level > global"""
+def _discover_project_dir():
+    """发现项目目录"""
     for env_var in ["CLAUDE_PROJECT_DIR", "PWD"]:
         d = os.environ.get(env_var, "")
-        if d and ".." not in d:  # prevent directory traversal
-            p = os.path.join(d, ".claude", "blackboard", "state.json")
-            if os.path.isfile(p):
-                return os.path.dirname(p), p
+        if d and ".." not in d:
+            return d
     try:
         import subprocess
         r = subprocess.run(["git", "rev-parse", "--show-toplevel"],
                            capture_output=True, text=True, timeout=5)
         if r.returncode == 0:
-            p = os.path.join(r.stdout.strip(), ".claude", "blackboard", "state.json")
-            if os.path.isfile(p):
-                return os.path.dirname(p), p
+            return r.stdout.strip()
     except Exception:
         pass
-    bb = os.path.join(os.path.expanduser("~"), ".claude", "blackboard")
-    os.makedirs(bb, exist_ok=True)
-    return bb, os.path.join(bb, "state.json")
+    return None
 
 
 def _now():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
+
+def _now_dt():
+    return datetime.now(timezone.utc)
+
+
 def _is_uuid(s):
-    """判断字符串是否是UUID格式"""
     try:
         import uuid as _uuid
         _uuid.UUID(s)
@@ -83,23 +84,9 @@ def _is_uuid(s):
 
 
 def _require_uuid(session_id: str) -> str:
-    """校验session_id必须是UUID格式，否则返回错误信息。所有bb_*工具调用前必须先调用此函数。"""
     if not session_id or not _is_uuid(session_id):
         return f"ERROR: session_id必须是UUID格式，收到'{session_id}'。请使用SessionStart hook注入的session_id。"
     return ""
-
-
-def _empty_state():
-    return {
-        "version": 4,
-        "last_updated": _now(),
-        "sessions": {},
-        "file_registry": {},
-        "build_locks": {},
-        "knowledge": {},
-        "decisions": [],
-        "bug_patterns": [],
-    }
 
 
 def _try_load_json(path):
@@ -110,99 +97,113 @@ def _try_load_json(path):
         return None
 
 
-def _rebuild_from_events(events_path):
-    """从events.log回放重建state（最后手段）"""
-    state = _empty_state()
-    if not os.path.isfile(events_path):
-        return state
+def _file_mtime(path):
     try:
-        with open(events_path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = [p.strip() for p in line.split("|")]
-                if len(parts) < 4:
-                    continue
-                ts, sid, event_type = parts[0], parts[1], parts[2]
-                if event_type in ("SESSION_STARTED", "REGISTERED"):
-                    if sid not in state["sessions"]:
-                        state["sessions"][sid] = {
-                            "name": sid, "started_at": ts, "heartbeat": ts,
-                            "status": "active", "task": "", "claimed_files": [],
-                        }
-                elif event_type == "DEREGISTERED":
-                    if sid in state["sessions"]:
-                        state["sessions"][sid]["status"] = "ended"
-        state["last_updated"] = _now()
-    except Exception:
-        pass
-    return state
+        return os.path.getmtime(path) if path and os.path.isfile(path) else 0
+    except OSError:
+        return 0
 
 
-def _load_state():
-    global _state, _state_file, _events_file
-    bb_dir, sf = _discover_state_file()
-    _state_file = sf
-    _events_file = os.path.join(bb_dir, "events.log")
-    bak = sf + ".bak"
-
-    # 恢复链: state.json → .bak → events.log → 空
-    _state = _try_load_json(_state_file)
-    if _state is None and os.path.isfile(bak):
-        _state = _try_load_json(bak)
-    if _state is None:
-        _state = _rebuild_from_events(_events_file)
-    if _state is None:
-        _state = _empty_state()
-
-    # 确保v4字段
-    for key in ("sessions", "file_registry", "build_locks", "knowledge"):
-        _state.setdefault(key, {})
-    for key in ("decisions", "bug_patterns"):
-        _state.setdefault(key, [])
-
-    # MCP重启恢复：把ended session恢复为active（给Claude一个心跳刷新的窗口）
-    # 如果session在MCP重启前是active的，重启后应该保留，等心跳超时再清理
-    recovered = 0
-    for sid, s in _state.get("sessions", {}).items():
-        if s.get("status") == "ended":
-            # 检查心跳是否在2小时内（可能是MCP重启导致的，不是真的结束）
-            hb_str = s.get("heartbeat", "")
-            try:
-                hb = datetime.fromisoformat(hb_str.replace("Z", "+00:00"))
-                if (datetime.now(timezone.utc) - hb).total_seconds() < 7200:  # 2小时内
-                    s["status"] = "active"
-                    recovered += 1
-            except (ValueError, KeyError):
-                pass
-    if recovered:
-        _save_state()
-
-
-def _save_state():
+def _atomic_write(path, data):
     """原子写入 + .bak备份"""
-    global _state_mtime
-    _state["last_updated"] = _now()
-    dn = os.path.dirname(_state_file)
-    # 先备份当前文件
-    if os.path.isfile(_state_file):
+    dn = os.path.dirname(path)
+    os.makedirs(dn, exist_ok=True)
+    if os.path.isfile(path):
         try:
-            shutil.copy2(_state_file, _state_file + ".bak")
+            shutil.copy2(path, path + ".bak")
         except OSError:
             pass
-    # 原子写入
     fd, tmp = tempfile.mkstemp(dir=dn, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(_state, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, _state_file)
-        _state_mtime = os.path.getmtime(_state_file)
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, path)
     except Exception:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+
+
+def _load_state():
+    """双层加载：全局(sessions+knowledge) + 项目级(file_registry+build_locks)"""
+    global _state, _proj_state, _global_file, _proj_file, _events_file, _global_mtime, _proj_mtime
+
+    # 全局路径
+    os.makedirs(GLOBAL_BB_DIR, exist_ok=True)
+    _global_file = os.path.join(GLOBAL_BB_DIR, "state.json")
+    _events_file = os.path.join(GLOBAL_BB_DIR, "events.log")
+
+    # 项目级路径
+    proj_dir = _discover_project_dir()
+    if proj_dir:
+        proj_bb = os.path.join(proj_dir, ".claude", "blackboard")
+        os.makedirs(proj_bb, exist_ok=True)
+        _proj_file = os.path.join(proj_bb, "state.json")
+    else:
+        _proj_file = None
+
+    # 加载全局（恢复链: state.json → .bak → 空）
+    _state = _try_load_json(_global_file)
+    if _state is None:
+        bak = _global_file + ".bak"
+        _state = _try_load_json(bak) if os.path.isfile(bak) else None
+    if _state is None:
+        _state = {"version": 4, "last_updated": _now(), "sessions": {},
+                  "knowledge": {}, "decisions": [], "bug_patterns": []}
+    _state.setdefault("sessions", {})
+    _state.setdefault("knowledge", {})
+    _state.setdefault("decisions", [])
+    _state.setdefault("bug_patterns", [])
+
+    # MCP重启韧性：2h内ended/stale → active
+    now = _now_dt()
+    for sid in list(_state["sessions"]):
+        s = _state["sessions"][sid]
+        if s.get("status") in ("ended", "stale"):
+            try:
+                hb = datetime.fromisoformat(s["heartbeat"].replace("Z", "+00:00"))
+                if now - hb < timedelta(hours=2):
+                    s["status"] = "active"
+                    s["heartbeat"] = _now()
+            except (ValueError, KeyError):
+                pass
+
+    # 加载项目级
+    if _proj_file:
+        _proj_state = _try_load_json(_proj_file)
+        if _proj_state is None:
+            bak = _proj_file + ".bak"
+            _proj_state = _try_load_json(bak) if os.path.isfile(bak) else None
+        if _proj_state is None:
+            _proj_state = {"version": 4, "file_registry": {}, "build_locks": {}}
+        _proj_state.setdefault("file_registry", {})
+        _proj_state.setdefault("build_locks", {})
+    else:
+        _proj_state = {"version": 4, "file_registry": {}, "build_locks": {}}
+
+    _global_mtime = _file_mtime(_global_file)
+    _proj_mtime = _file_mtime(_proj_file) if _proj_file else 0
+
+
+def _save_state():
+    """双层原子写入"""
+    global _global_mtime, _proj_mtime
+    _state["last_updated"] = _now()
+    _atomic_write(_global_file, _state)
+    _global_mtime = _file_mtime(_global_file)
+    if _proj_file:
+        _proj_state["last_updated"] = _now()
+        _atomic_write(_proj_file, _proj_state)
+        _proj_mtime = _file_mtime(_proj_file)
+
+
+def _maybe_reload_from_disk():
+    """检测磁盘变化，自动reload"""
+    gm = _file_mtime(_global_file)
+    pm = _file_mtime(_proj_file) if _proj_file else 0
+    if gm > _global_mtime or pm > _proj_mtime:
+        _load_state()
 
 
 def _append_event(msg):
@@ -214,60 +215,68 @@ def _append_event(msg):
 
 
 def _auto_cleanup(caller_sid=None):
-    """每次工具调用时: 从磁盘reload(如果hook更新了) + 清理stale + 刷新心跳"""
-    global _state, _state_mtime
-    # 检测磁盘state.json是否比内存新（SessionStart hook可能写入了）
-    if _state_file and os.path.isfile(_state_file):
+    """自动清理：磁盘reload + stale两级 + orphan + expired locks + ended purge"""
+    _maybe_reload_from_disk()
+
+    now = _now_dt()
+    soft_cutoff = now - timedelta(minutes=STALE_SOFT_MINUTES)
+    hard_cutoff = now - timedelta(minutes=STALE_HARD_MINUTES)
+    ended_cutoff = now - timedelta(hours=ENDED_PURGE_HOURS)
+
+    # 两级stale清理
+    for sid in list(_state.get("sessions", {})):
+        s = _state["sessions"][sid]
+        if s.get("status") not in ("active", "stale"):
+            continue
         try:
-            disk_mtime = os.path.getmtime(_state_file)
-            if disk_mtime > _state_mtime:
-                new_state = _try_load_json(_state_file)
-                if new_state is not None:
-                    _state = new_state
-                    _state_mtime = disk_mtime
-                    for key in ("sessions", "file_registry", "build_locks", "knowledge"):
-                        _state.setdefault(key, {})
-                    for key in ("decisions", "bug_patterns"):
-                        _state.setdefault(key, [])
-        except OSError:
+            hb = datetime.fromisoformat(s["heartbeat"].replace("Z", "+00:00"))
+            if s.get("status") == "stale" and hb < hard_cutoff:
+                s["status"] = "ended"
+                for fp in list(s.get("claimed_files", [])):
+                    _proj_state.get("file_registry", {}).pop(fp, None)
+                s["claimed_files"] = []
+                for proj in list(_proj_state.get("build_locks", {})):
+                    lock = _proj_state["build_locks"][proj]
+                    owner = lock if isinstance(lock, str) else lock.get("session_id", "")
+                    if owner == sid:
+                        del _proj_state["build_locks"][proj]
+            elif hb < soft_cutoff and s.get("status") == "active":
+                s["status"] = "stale"
+        except (ValueError, KeyError):
             pass
 
-    now = datetime.now(timezone.utc)
-    stale = []
-    for sid, s in _state.get("sessions", {}).items():
-        if s.get("status") != "active":
-            continue
-        hb_str = s.get("heartbeat", "")
-        try:
-            hb = datetime.fromisoformat(hb_str.replace("Z", "+00:00"))
-            if (now - hb).total_seconds() > STALE_TIMEOUT_MINUTES * 60:
-                stale.append(sid)
-        except (ValueError, KeyError):
-            stale.append(sid)
+    # Orphan资源清理
+    active_sids = {sid for sid, s in _state.get("sessions", {}).items() if s.get("status") == "active"}
+    for fp in list(_proj_state.get("file_registry", {})):
+        if _proj_state["file_registry"][fp] not in active_sids:
+            del _proj_state["file_registry"][fp]
+    for proj in list(_proj_state.get("build_locks", {})):
+        lock = _proj_state["build_locks"][proj]
+        owner = lock if isinstance(lock, str) else lock.get("session_id", "")
+        if owner not in active_sids:
+            del _proj_state["build_locks"][proj]
 
-    for sid in stale:
-        s = _state["sessions"][sid]
-        s["status"] = "stale"
-        for fp in list(s.get("claimed_files", [])):
-            if _state.get("file_registry", {}).get(fp) == sid:
-                del _state["file_registry"][fp]
-        # 释放编译锁
-        for proj in list(_state.get("build_locks", {})):
-            lock = _state["build_locks"][proj]
-            owner = lock if isinstance(lock, str) else lock.get("session_id", "")
-            if owner == sid:
-                del _state["build_locks"][proj]
-
-    # Release expired build locks (>10min held, regardless of session status)
-    for proj in list(_state.get("build_locks", {})):
-        lock = _state["build_locks"][proj]
+    # Expired build locks (>10min)
+    for proj in list(_proj_state.get("build_locks", {})):
+        lock = _proj_state["build_locks"][proj]
         if isinstance(lock, dict) and lock.get("acquired_at"):
             try:
                 at = datetime.fromisoformat(lock["acquired_at"].replace("Z", "+00:00"))
-                if (now - at).total_seconds() > 600:
-                    del _state["build_locks"][proj]
+                if (now - at).total_seconds() > BUILD_LOCK_TIMEOUT_SECONDS:
+                    del _proj_state["build_locks"][proj]
             except (ValueError, KeyError):
-                del _state["build_locks"][proj]
+                del _proj_state["build_locks"][proj]
+
+    # Ended purge (>24h)
+    for sid in list(_state.get("sessions", {})):
+        s = _state["sessions"][sid]
+        if s.get("status") == "ended":
+            try:
+                hb = datetime.fromisoformat(s["heartbeat"].replace("Z", "+00:00"))
+                if hb < ended_cutoff:
+                    del _state["sessions"][sid]
+            except (ValueError, KeyError):
+                del _state["sessions"][sid]
 
     # 刷新调用者心跳
     if caller_sid and caller_sid in _state.get("sessions", {}):
@@ -276,7 +285,6 @@ def _auto_cleanup(caller_sid=None):
 
 
 def _rotate_events(max_lines=500, keep_lines=200):
-    """events.log自动rotation"""
     if not os.path.isfile(_events_file):
         return
     try:
@@ -290,21 +298,16 @@ def _rotate_events(max_lines=500, keep_lines=200):
         pass
 
 
-# ─── 知识衰减后台线程 ───
+# ─── 后台线程 ───
 
 def _stale_cleanup_loop():
-    """后台线程：每60秒清理stale session + 从磁盘reload"""
+    """每60秒执行自动清理"""
     while True:
         time.sleep(60)
         try:
             with _lock:
                 _auto_cleanup()
-                # 清理完stale后保存
-                stale_count = sum(1 for s in _state.get("sessions", {}).values() if s.get("status") == "stale")
-                if stale_count:
-                    for sid in [k for k, v in _state["sessions"].items() if v.get("status") == "stale"]:
-                        _state["sessions"][sid]["status"] = "ended"
-                    _save_state()
+                _save_state()
         except Exception:
             pass
 
@@ -314,7 +317,7 @@ def _decay_loop():
         time.sleep(DECAY_INTERVAL)
         try:
             with _lock:
-                now = datetime.now(timezone.utc)
+                now = _now_dt()
                 changed = False
                 to_archive = []
                 for fp, k in list(_state.get("knowledge", {}).items()):
@@ -351,19 +354,17 @@ def _decay_loop():
 @mcp.tool()
 def bb_register(session_id: str, name: str = "", task: str = "") -> str:
     """注册或更新session信息。新session启动时调用。
-    session_id: 必填。由SessionStart hook注入的UUID，用于查找已有session。必须使用hook注入的值，不要用自定义名字。
-    name: 显示名称（可选，用于覆盖UUID显示）。
-    task: 当前任务描述，必须写清楚你在做什么。"""
-    # session_id必须是UUID格式
+    session_id: 必填。由SessionStart hook注入的UUID。
+    name: 显示名称（可选）。
+    task: 当前任务描述。"""
     if not _is_uuid(session_id):
         return f"ERROR: session_id必须是UUID格式，收到'{session_id}'。请使用SessionStart hook注入的session_id。"
     with _lock:
         _auto_cleanup(session_id)
-        _state.setdefault("sessions", {})
         ts = _now()
+        proj_dir = _discover_project_dir() or ""
 
         if session_id in _state["sessions"]:
-            # 更新已有session（hook已注册，Claude补充task/name）
             existing = _state["sessions"][session_id]
             existing["heartbeat"] = ts
             existing["status"] = "active"
@@ -371,17 +372,19 @@ def bb_register(session_id: str, name: str = "", task: str = "") -> str:
                 existing["task"] = task
             if name:
                 existing["display_name"] = name
+            if proj_dir:
+                existing["project_dir"] = proj_dir
             _save_state()
             _rotate_events()
             _append_event(f"{ts} | {session_id} | REGISTERED | name={name} task={task}")
             display = existing.get("display_name", session_id[:8])
             return f"Updated: {display} (task={existing.get('task','')})"
 
-        # 新session（session_id作为主键）
         _state["sessions"][session_id] = {
             "name": name or session_id, "display_name": name or "",
             "started_at": ts, "heartbeat": ts,
             "status": "active", "task": task, "claimed_files": [],
+            "project_dir": proj_dir,
         }
         _save_state()
         _rotate_events()
@@ -399,14 +402,14 @@ def bb_deregister(session_id: str) -> str:
         _auto_cleanup(session_id)
         if session_id in _state.get("sessions", {}):
             for fp in _state["sessions"][session_id].get("claimed_files", []):
-                if _state.get("file_registry", {}).get(fp) == session_id:
-                    _state["file_registry"].pop(fp, None)
+                if _proj_state.get("file_registry", {}).get(fp) == session_id:
+                    _proj_state["file_registry"].pop(fp, None)
                     released.append(fp)
-            for proj in list(_state.get("build_locks", {})):
-                lock = _state["build_locks"][proj]
+            for proj in list(_proj_state.get("build_locks", {})):
+                lock = _proj_state["build_locks"][proj]
                 owner = lock if isinstance(lock, str) else lock.get("session_id", "")
                 if owner == session_id:
-                    del _state["build_locks"][proj]
+                    del _proj_state["build_locks"][proj]
             _state["sessions"][session_id]["status"] = "ended"
             _save_state()
     _append_event(f"{_now()} | {session_id} | DEREGISTERED | released={len(released)} files")
@@ -415,7 +418,7 @@ def bb_deregister(session_id: str) -> str:
 
 @mcp.tool()
 def bb_heartbeat(session_id: str) -> str:
-    """刷新session心跳。15分钟无心跳标记stale。"""
+    """刷新session心跳。"""
     err = _require_uuid(session_id)
     if err: return err
     with _lock:
@@ -430,20 +433,20 @@ def bb_heartbeat(session_id: str) -> str:
 
 @mcp.tool()
 def bb_claim_file(session_id: str, file_path: str) -> str:
-    """声明文件占用。冲突返回CONFLICT，已占用返回OWN，成功返回CLAIMED。"""
+    """声明文件占用（项目级）。冲突返回CONFLICT，已占用返回OWN，成功返回CLAIMED。"""
     err = _require_uuid(session_id)
     if err: return err
     file_path = file_path.lstrip("./")
     with _lock:
         _auto_cleanup(session_id)
-        fr = _state.setdefault("file_registry", {})
+        fr = _proj_state.setdefault("file_registry", {})
         if file_path in fr:
             owner = fr[file_path]
             if owner == session_id:
                 return f"OWN: {file_path}"
             owner_s = _state.get("sessions", {}).get(owner, {})
             if owner_s.get("status") == "active":
-                return f"CONFLICT: {file_path} claimed by '{owner_s.get('name', owner)}'"
+                return f"CONFLICT: {file_path} claimed by '{owner_s.get('display_name', owner[:8])}'"
         fr[file_path] = session_id
         sess = _state.get("sessions", {}).get(session_id, {})
         claimed = sess.setdefault("claimed_files", [])
@@ -455,13 +458,13 @@ def bb_claim_file(session_id: str, file_path: str) -> str:
 
 @mcp.tool()
 def bb_release_file(session_id: str, file_path: str) -> str:
-    """释放文件占用。"""
+    """释放文件占用（项目级）。"""
     err = _require_uuid(session_id)
     if err: return err
     file_path = file_path.lstrip("./")
     with _lock:
         _auto_cleanup(session_id)
-        fr = _state.get("file_registry", {})
+        fr = _proj_state.get("file_registry", {})
         if fr.get(file_path) == session_id:
             del fr[file_path]
             claimed = _state.get("sessions", {}).get(session_id, {}).get("claimed_files", [])
@@ -474,9 +477,10 @@ def bb_release_file(session_id: str, file_path: str) -> str:
 
 @mcp.tool()
 def bb_check_conflicts(file_paths: str = "") -> str:
-    """查询文件占用状态。file_paths逗号分隔，空则查全部。"""
+    """查询文件占用状态（项目级）。file_paths逗号分隔，空则查全部。"""
     with _lock:
-        fr = _state.get("file_registry", {})
+        _auto_cleanup()
+        fr = _proj_state.get("file_registry", {})
         if file_paths:
             paths = [p.strip().lstrip("./") for p in file_paths.split(",") if p.strip()]
         else:
@@ -487,7 +491,7 @@ def bb_check_conflicts(file_paths: str = "") -> str:
         for fp in paths:
             owner = fr.get(fp, "")
             if owner:
-                name = _state.get("sessions", {}).get(owner, {}).get("name", owner[:16])
+                name = _state.get("sessions", {}).get(owner, {}).get("display_name", owner[:8])
                 lines.append(f"  {fp} -> {name}")
             else:
                 lines.append(f"  {fp} -> FREE")
@@ -496,32 +500,30 @@ def bb_check_conflicts(file_paths: str = "") -> str:
 
 @mcp.tool()
 def bb_acquire_build_lock(session_id: str, project_dir: str = "") -> str:
-    """获取编译锁。同一项目只允许1个session编译。返回ACQUIRED或CONFLICT。"""
+    """获取编译锁（项目级）。同一项目只允许1个session编译。"""
     err = _require_uuid(session_id)
     if err: return err
     with _lock:
         _auto_cleanup(session_id)
-        locks = _state.setdefault("build_locks", {})
+        locks = _proj_state.setdefault("build_locks", {})
         existing = locks.get(project_dir)
         if existing:
             owner = existing if isinstance(existing, str) else existing.get("session_id", "")
             if owner != session_id:
                 owner_s = _state.get("sessions", {}).get(owner, {})
                 if owner_s.get("status") == "active":
-                    # 检查锁是否超时(>10min)
                     acquired_at = existing.get("acquired_at", "") if isinstance(existing, dict) else ""
                     if acquired_at:
                         try:
                             at = datetime.fromisoformat(acquired_at.replace("Z", "+00:00"))
-                            if (datetime.now(timezone.utc) - at).total_seconds() > 600:
-                                # 锁超时，自动释放
-                                pass
+                            if (_now_dt() - at).total_seconds() > BUILD_LOCK_TIMEOUT_SECONDS:
+                                pass  # timeout, will be replaced
                             else:
-                                return f"CONFLICT: Build lock held by '{owner_s.get('name', owner)}'. Wait or call bb_release_build_lock."
+                                return f"CONFLICT: Build lock held by '{owner_s.get('display_name', owner[:8])}'."
                         except (ValueError, KeyError):
                             pass
                     else:
-                        return f"CONFLICT: Build lock held by '{owner_s.get('name', owner)}'. Wait or call bb_release_build_lock."
+                        return f"CONFLICT: Build lock held by '{owner_s.get('display_name', owner[:8])}'."
         locks[project_dir] = {"session_id": session_id, "acquired_at": _now()}
         _save_state()
     _append_event(f"{_now()} | {session_id} | BUILD_LOCK_ACQUIRED | project={project_dir}")
@@ -530,12 +532,12 @@ def bb_acquire_build_lock(session_id: str, project_dir: str = "") -> str:
 
 @mcp.tool()
 def bb_release_build_lock(session_id: str, project_dir: str = "") -> str:
-    """释放编译锁。编译完成后必须调用。"""
+    """释放编译锁（项目级）。"""
     err = _require_uuid(session_id)
     if err: return err
     with _lock:
         _auto_cleanup(session_id)
-        locks = _state.get("build_locks", {})
+        locks = _proj_state.get("build_locks", {})
         lock = locks.get(project_dir)
         if lock:
             owner = lock if isinstance(lock, str) else lock.get("session_id", "")
@@ -548,37 +550,40 @@ def bb_release_build_lock(session_id: str, project_dir: str = "") -> str:
 
 @mcp.tool()
 def bb_status() -> str:
-    """查看Blackboard完整状态：sessions、文件占用、编译锁、知识统计、健康检查。"""
+    """查看Blackboard完整状态：全局sessions + 项目级文件占用/编译锁 + 知识 + 健康检查。"""
     with _lock:
         _auto_cleanup()
         lines = ["=== Blackboard Status ==="]
 
-        # Sessions
+        # Sessions (全局)
         active = sum(1 for s in _state["sessions"].values() if s.get("status") == "active")
         stale = sum(1 for s in _state["sessions"].values() if s.get("status") == "stale")
-        lines.append(f"\nSessions: {len(_state['sessions'])} total, {active} active, {stale} stale")
+        ended = sum(1 for s in _state["sessions"].values() if s.get("status") == "ended")
+        lines.append(f"\nSessions: {len(_state['sessions'])} total, {active} active, {stale} stale, {ended} ended")
         for sid, s in _state["sessions"].items():
             status = s.get("status", "?")
-            name = s.get("name", sid[:16])
+            display = s.get("display_name", sid[:8])
             task = s.get("task", "")
+            proj = s.get("project_dir", "")
+            proj_short = os.path.basename(proj) if proj else "?"
             files = len(s.get("claimed_files", []))
-            lines.append(f"  [{status:>7}] {name} | files={files} | {task}")
+            lines.append(f"  [{status:>7}] {display} | proj={proj_short} | files={files} | {task}")
 
-        # File registry
-        lines.append(f"\nFile claims: {len(_state['file_registry'])}")
-        for fp, owner in list(_state["file_registry"].items())[:20]:
-            name = _state["sessions"].get(owner, {}).get("name", owner[:16])
+        # File registry (项目级)
+        lines.append(f"\nFile claims: {len(_proj_state['file_registry'])}")
+        for fp, owner in list(_proj_state["file_registry"].items())[:20]:
+            name = _state["sessions"].get(owner, {}).get("display_name", owner[:8])
             lines.append(f"  {fp} -> {name}")
 
-        # Build locks
-        if _state["build_locks"]:
-            lines.append(f"\nBuild locks: {len(_state['build_locks'])}")
-            for proj, lock in _state["build_locks"].items():
+        # Build locks (项目级)
+        if _proj_state["build_locks"]:
+            lines.append(f"\nBuild locks: {len(_proj_state['build_locks'])}")
+            for proj, lock in _proj_state["build_locks"].items():
                 owner = lock if isinstance(lock, str) else lock.get("session_id", "")
-                name = _state["sessions"].get(owner, {}).get("name", owner[:16])
+                name = _state["sessions"].get(owner, {}).get("display_name", owner[:8])
                 lines.append(f"  {proj} -> {name}")
 
-        # Knowledge
+        # Knowledge (全局)
         kn = _state.get("knowledge", {})
         high = sum(1 for k in kn.values() if k.get("confidence", 0) >= SOLIDIFY_THRESHOLD)
         lines.append(f"\nKnowledge: {len(kn)} entries, {high} high-confidence")
@@ -603,10 +608,11 @@ def bb_status() -> str:
         # Health Check
         lines.append("\n--- Health Check ---")
         checks = []
-        checks.append(("state.json", "OK" if _state else "CORRUPT"))
+        checks.append(("global state", "OK" if _state else "CORRUPT"))
+        checks.append(("project state", "OK" if _proj_state else "CORRUPT"))
         checks.append(("events.log", "OK" if os.path.isfile(_events_file or "") else "MISSING"))
         dead_locks = 0
-        for proj, lock in _state.get("build_locks", {}).items():
+        for proj, lock in _proj_state.get("build_locks", {}).items():
             owner = lock if isinstance(lock, str) else lock.get("session_id", "")
             if owner not in _state.get("sessions", {}) or _state["sessions"][owner].get("status") != "active":
                 dead_locks += 1
@@ -620,7 +626,7 @@ def bb_status() -> str:
 
 @mcp.tool()
 def bb_event(session_id: str, event_type: str, details: str = "") -> str:
-    """记录事件。类型: SESSION_STARTED/ENDED, DISCOVERY, WARNING, ERROR, MILESTONE, DECISION, BLOCKED, UNBLOCKED, CUSTOM。"""
+    """记录事件。"""
     err = _require_uuid(session_id)
     if err: return err
     with _lock:
@@ -645,8 +651,8 @@ def bb_session_files(session_id: str) -> str:
             return f"Session {session_id} not found"
         claimed = session.get("claimed_files", [])
         if not claimed:
-            return f"No files claimed by {session.get('name', session_id)}"
-        return f"Files claimed by {session.get('name', session_id)}:\n" + "\n".join(f"  {f}" for f in claimed)
+            return f"No files claimed by {session.get('display_name', session_id[:8])}"
+        return f"Files claimed by {session.get('display_name', session_id[:8])}:\n" + "\n".join(f"  {f}" for f in claimed)
 
 
 # ─── 知识管理 ───
@@ -745,7 +751,7 @@ def bb_validate_knowledge(session_id: str, fingerprint: str, verdict: str, note:
 @mcp.tool()
 def bb_get_recent_knowledge(hours: int = 48) -> str:
     """获取最近N小时的知识、决策、Bug模式。新session启动时调用。"""
-    now = datetime.now(timezone.utc)
+    now = _now_dt()
     cutoff = now - timedelta(hours=hours)
     with _lock:
         _auto_cleanup()
@@ -766,7 +772,7 @@ def bb_get_recent_knowledge(hours: int = 48) -> str:
             for fp, k in sorted(recent_kn, key=lambda x: -x[1].get("confidence", 0)):
                 lines.append(f"  [{k.get('confidence', 0):.1f}] ({k.get('category', '')}) {fp}: {k.get('text', '')[:80]}")
 
-        recent_dec = [d for d in _state.get("decisions", []) if True]
+        recent_dec = _state.get("decisions", [])
         if recent_dec:
             lines.append(f"\nDecisions ({len(recent_dec)}):")
             for d in recent_dec:
@@ -774,7 +780,7 @@ def bb_get_recent_knowledge(hours: int = 48) -> str:
                 if d.get("rationale"):
                     lines.append(f"    Why: {d['rationale'][:60]}")
 
-        recent_bp = [b for b in _state.get("bug_patterns", []) if True]
+        recent_bp = _state.get("bug_patterns", [])
         if recent_bp:
             lines.append(f"\nBug Patterns ({len(recent_bp)}):")
             for b in recent_bp:
@@ -826,10 +832,6 @@ def bb_report_bug_pattern(session_id: str, pattern: str, root_cause: str, fix: s
 # ─── 启动 ───
 
 _load_state()
-
-# 初始化_state_mtime
-if _state_file and os.path.isfile(_state_file):
-    _state_mtime = os.path.getmtime(_state_file)
 
 _decay_thread = threading.Thread(target=_decay_loop, daemon=True)
 _decay_thread.start()

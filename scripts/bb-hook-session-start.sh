@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# bb-hook-session-start.sh — SessionStart hook: register session + cleanup stale
-# Only writes state.json, does not call MCP. MCP server auto-reloads from disk.
+# bb-hook-session-start.sh — SessionStart hook: register session to GLOBAL state.json
+# All projects share the same global registry. File claims/locks are per-project.
 set -uo pipefail
 
 INPUT=$(cat 2>/dev/null || echo "{}")
@@ -10,56 +10,43 @@ CWD=$(echo "$INPUT" | python -c "import json,sys; d=json.load(sys.stdin); print(
 
 [ -z "$SESSION_ID" ] && exit 0
 
-# Validate session_id format (must be UUID or simple identifier, no shell metacharacters)
+# Validate session_id format
 if echo "$SESSION_ID" | grep -qE '[;&|`$(){}!]'; then
     echo "BLOCKED: Invalid session_id format" >&2
     exit 1
 fi
 
-# Discover state.json
-SF=""
-for d in "$CWD" "$(pwd)"; do
-    if [ -f "$d/.claude/blackboard/state.json" ]; then
-        SF="$d/.claude/blackboard/state.json"
-        break
-    fi
-done
-if [ -z "$SF" ]; then
-    BB_DIR="$HOME/.claude/blackboard"
-    mkdir -p "$BB_DIR"
-    SF="$BB_DIR/state.json"
-fi
-
-BB_DIR=$(dirname "$SF")
+# Always write to GLOBAL state.json
+BB_DIR="$HOME/.claude/blackboard"
+mkdir -p "$BB_DIR"
+SF="$BB_DIR/state.json"
 EVENTS_LOG="$BB_DIR/events.log"
 TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-# Initialize state.json if not exists (pass path as argument, not interpolated)
+# Initialize if not exists
 [ ! -f "$SF" ] && python - "$SF" "$TIMESTAMP" << 'PYINIT' > /dev/null 2>&1 || true
 import json, os, sys
 sf, ts = sys.argv[1:3]
 os.makedirs(os.path.dirname(sf), exist_ok=True)
-s = {"version":4,"last_updated":ts,"sessions":{},"file_registry":{},"build_locks":{},"knowledge":{},"decisions":[],"bug_patterns":[]}
+s = {"version":4,"last_updated":ts,"sessions":{},"knowledge":{},"decisions":[],"bug_patterns":[]}
 with open(sf, "w", encoding="utf-8") as f:
     json.dump(s, f, indent=2, ensure_ascii=False)
 PYINIT
 
-# Register + cleanup stale + cleanup expired locks + rotate events.log
-# Uses file locking to prevent race conditions when multiple sessions start simultaneously
-python - "$SF" "$SESSION_ID" "$TIMESTAMP" "$EVENTS_LOG" << 'PYEOF' > /dev/null 2>&1 || true
+# Register + cleanup stale + rotate events.log
+# Uses file locking to prevent race conditions
+python - "$SF" "$SESSION_ID" "$TIMESTAMP" "$CWD" "$EVENTS_LOG" << 'PYEOF' > /dev/null 2>&1 || true
 import json, sys, os, tempfile, shutil
 from datetime import datetime, timezone, timedelta
 
-state_file, session_id, ts, events_log = sys.argv[1:5]
+state_file, session_id, ts, cwd, events_log = sys.argv[1:6]
 
-# Validate inputs
 if not session_id or not state_file:
     sys.exit(0)
-# Sanitize: reject paths with directory traversal
 if ".." in state_file or ".." in session_id:
     sys.exit(1)
 
-# File locking for race condition prevention
+# File locking
 lock_file = state_file + ".lock"
 lock_fd = None
 
@@ -97,14 +84,13 @@ def release_lock():
         pass
 
 if not acquire_lock():
-    # Could not acquire lock, another hook is running. Wait briefly and retry.
     import time
     time.sleep(0.5)
     if not acquire_lock():
-        sys.exit(0)  # Give up gracefully
+        sys.exit(0)
 
 try:
-    # Load state with recovery chain: state.json -> .bak -> empty
+    # Load with recovery chain
     try:
         with open(state_file, "r", encoding="utf-8") as f:
             state = json.load(f)
@@ -118,17 +104,19 @@ try:
             except (json.JSONDecodeError, OSError):
                 state = None
         if state is None:
-            state = {"version":4,"sessions":{},"file_registry":{},"build_locks":{},"knowledge":{},"decisions":[],"bug_patterns":[]}
+            state = {"version":4,"sessions":{},"knowledge":{},"decisions":[],"bug_patterns":[]}
 
     now = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    soft_cutoff = timedelta(minutes=30)  # 30min无心跳→stale
-    hard_cutoff = timedelta(minutes=35)  # stale超过5min→ended
+    soft_cutoff = timedelta(minutes=30)
+    hard_cutoff = timedelta(minutes=35)
+    ended_cutoff = timedelta(hours=24)
 
     state.setdefault("sessions", {})
-    state.setdefault("file_registry", {})
-    state.setdefault("build_locks", {})
+    state.setdefault("knowledge", {})
+    state.setdefault("decisions", [])
+    state.setdefault("bug_patterns", [])
 
-    # 两级stale清理：soft(可恢复) → hard(ended+释放资源)
+    # Two-level stale cleanup
     for sid in list(state["sessions"]):
         s = state["sessions"][sid]
         if s.get("status") not in ("active", "stale"):
@@ -136,59 +124,45 @@ try:
         try:
             hb = datetime.fromisoformat(s["heartbeat"].replace("Z", "+00:00"))
             if s.get("status") == "stale" and (now - hb) > hard_cutoff:
-                # Hard: stale超时 → ended，释放资源
-                for fp in list(s.get("claimed_files", [])):
-                    state["file_registry"].pop(fp, None)
-                s["claimed_files"] = []
                 s["status"] = "ended"
-            elif (now - hb) > soft_cutoff:
-                # Soft: 30min无心跳 → stale
+                s["claimed_files"] = []
+            elif (now - hb) > soft_cutoff and s.get("status") == "active":
                 s["status"] = "stale"
         except (ValueError, KeyError):
             pass
 
-    # Orphan资源清理：owner不存在或非active → 释放
-    active_sids = {sid for sid, s in state["sessions"].items() if s.get("status") == "active"}
-    for fp in list(state.get("file_registry", {})):
-        if state["file_registry"][fp] not in active_sids:
-            del state["file_registry"][fp]
-    for proj in list(state.get("build_locks", {})):
-        lock = state["build_locks"][proj]
-        owner = lock if isinstance(lock, str) else lock.get("session_id", "")
-        if owner not in active_sids:
-            del state["build_locks"][proj]
-
-    # Cleanup expired build locks (>10min held)
-    for proj in list(state.get("build_locks", {})):
-        lock = state["build_locks"][proj]
-        if isinstance(lock, dict) and lock.get("acquired_at"):
+    # Ended purge (>24h)
+    for sid in list(state["sessions"]):
+        s = state["sessions"][sid]
+        if s.get("status") == "ended":
             try:
-                at = datetime.fromisoformat(lock["acquired_at"].replace("Z", "+00:00"))
-                if (now - at).total_seconds() > 600:
-                    del state["build_locks"][proj]
+                hb = datetime.fromisoformat(s["heartbeat"].replace("Z", "+00:00"))
+                if (now - hb) > ended_cutoff:
+                    del state["sessions"][sid]
             except (ValueError, KeyError):
-                del state["build_locks"][proj]
+                del state["sessions"][sid]
 
     # Register current session
     if session_id not in state["sessions"]:
         state["sessions"][session_id] = {
             "name": session_id, "started_at": ts, "heartbeat": ts,
-            "status": "active", "task": "not set - call bb_register to update", "claimed_files": [],
+            "status": "active", "task": "not set - call bb_register to update",
+            "claimed_files": [], "project_dir": cwd,
         }
     else:
         state["sessions"][session_id]["heartbeat"] = ts
         state["sessions"][session_id]["status"] = "active"
+        if cwd:
+            state["sessions"][session_id]["project_dir"] = cwd
 
     state["last_updated"] = ts
 
-    # Backup before write
+    # Backup + atomic write
     if os.path.isfile(state_file):
         try:
             shutil.copy2(state_file, state_file + ".bak")
         except OSError:
             pass
-
-    # Atomic write
     dn = os.path.dirname(state_file)
     fd, tmp = tempfile.mkstemp(dir=dn, suffix=".tmp")
     try:
@@ -201,7 +175,7 @@ try:
         except OSError:
             pass
 
-    # Rotate events.log if too large (>500 lines -> keep last 200)
+    # Rotate events.log
     if os.path.isfile(events_log):
         try:
             with open(events_log, "r", encoding="utf-8") as f:
@@ -217,9 +191,9 @@ finally:
     release_lock()
 PYEOF
 
-echo "$TIMESTAMP | $SESSION_ID | SESSION_STARTED | auto-registered" >> "$EVENTS_LOG" 2>/dev/null || true
+echo "$TIMESTAMP | $SESSION_ID | SESSION_STARTED | cwd=$CWD" >> "$EVENTS_LOG" 2>/dev/null || true
 
-# Inject reminder: must update task + graceful degradation hint
+# Inject reminder
 echo ""
 echo "## Blackboard registration complete"
 echo ""
